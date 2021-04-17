@@ -7,6 +7,7 @@
  * SPDX-License-Identifier: (Apache-2.0 OR GPL-2.0-only)
  */
 
+#include <libaudit.h>
 #include <linux/audit.h>
 #include <poll.h>
 #include <sys/types.h>
@@ -35,6 +36,9 @@ FLAG(bool, audit_persist, true, "Attempt to retain control of audit");
 
 /// Audit debugger helper
 HIDDEN_FLAG(bool, audit_debug, false, "Debug Linux audit messages");
+
+/// Audit ingore all events for the procfs
+HIDDEN_FLAG(bool, audit_ignore_procfs, false, "Ingnore all events from /proc")
 
 /// Always uninstall all the audit rules that osquery uses when exiting
 FLAG(bool,
@@ -329,6 +333,17 @@ bool AuditdNetlinkReader::acquireMessages() noexcept {
   return true;
 }
 
+// Create and initialize the audit rule data according to the libaudit headers.
+// TODO: The current version of libaudit does not have audit_rule_create_data()
+// which can be used for creating and initializing the *audit_rule_data.
+struct audit_rule_data* audit_rule_create_data(void) {
+  struct audit_rule_data* rule = new (audit_rule_data);
+  if (rule != nullptr) {
+    memset(rule, 0, sizeof(*rule));
+  }
+  return rule;
+}
+
 bool AuditdNetlinkReader::configureAuditService() noexcept {
   VLOG(1) << "Attempting to configure the audit service";
 
@@ -392,54 +407,91 @@ bool AuditdNetlinkReader::configureAuditService() noexcept {
     }
   }
 
-  // Attempt to add each one of the rules we collected
-  for (int syscall_number : monitored_syscall_list_) {
-    audit_rule_data rule = {};
-    audit_rule_syscall_data(&rule, syscall_number);
-
-    // clang-format off
-    int rule_add_error = audit_add_rule_data(audit_netlink_handle_, &rule,
-      // We want to be notified when we exit from the syscall
-      AUDIT_FILTER_EXIT,
-
-      // Always audit this syscall event
-      AUDIT_ALWAYS
-    );
-    // clang-format on
-
-    // When exiting, don't remove the rules that were already installed, unless
-    // we have been asked to
-    if (rule_add_error >= 0) {
-      if (FLAGS_audit_debug) {
-        VLOG(1) << "Audit rule installed for syscall " << syscall_number;
-      }
-
-      installed_rule_list_.push_back(rule);
-      continue;
+  if (FLAGS_audit_ignore_procfs && FLAGS_audit_allow_fim_events) {
+    // Watching the /proc/sys folder since it has files that can be written into
+    // to temporarily change the kernel behaviour.
+    // https://docs.fedoraproject.org/en-US/Fedora/18/html
+    // /System_Administrators_Guide/s2-proc-dir-sys.html
+    VLOG(1) << "Installing rule for watching /proc/sys";
+    audit_rule_data* sys = audit_rule_create_data();
+    for (int syscall : monitored_syscall_list_) {
+      audit_rule_syscall_data(sys, syscall);
     }
 
-    if (FLAGS_audit_debug) {
-      VLOG(1) << "Audit rule for syscall " << syscall_number
-              << " could not be installed: " << (-errno);
-    }
+    char path[] = "dir=/proc/sys";
+    audit_rule_fieldpair_data(&sys, path, AUDIT_FILTER_EXIT);
+    int rc = audit_add_rule_data(
+        audit_netlink_handle_, sys, AUDIT_FILTER_EXIT, AUDIT_ALWAYS);
 
     if (FLAGS_audit_force_unconfigure) {
-      installed_rule_list_.push_back(rule);
+      installed_rule_list_.push_back(
+          std::make_tuple(sys, AUDIT_FILTER_EXIT, AUDIT_ALWAYS));
     }
 
-    rule_add_error = -rule_add_error;
+    if (rc < 0) {
+      VLOG(1) << "Failed to install rule for the path /proc/sys"
+              << ", error: " << audit_errno_to_name(rc);
+    }
 
-    if (rule_add_error != EEXIST) {
-      VLOG(1) << "The following syscall number could not be added to the audit "
-                 "service rules: "
-              << syscall_number << ". Some of the auditd "
-              << "table may not work properly (process_events, "
-              << "socket_events, process_file_events, user_events)";
+    // Ingoring the remaining /proc folder since it's mostly a virtual file
+    // system that containes information about the state of a process or the
+    // kernel and is mostly read only. It's a filesystem that is probed by a lot
+    // of agents, like performance and metrics counters which also includes
+    // osquery, due to which a lot of noise is generated when using osquery for
+    // watching FIM syscalls.
+    VLOG(1) << "Ignoring all audit events for read only procfs";
+    audit_rule_data* r = audit_rule_create_data();
+    audit_rule_syscallbyname_data(r, "all");
+    char exclude[] = "dir=/proc";
+    audit_rule_fieldpair_data(&r, exclude, AUDIT_FILTER_EXIT);
+    rc = audit_add_rule_data(
+        audit_netlink_handle_, r, AUDIT_FILTER_EXIT, AUDIT_NEVER);
+
+    if (FLAGS_audit_force_unconfigure) {
+      installed_rule_list_.push_back(
+          std::make_tuple(r, AUDIT_FILTER_EXIT, AUDIT_NEVER));
+    }
+
+    if (rc < 0) {
+      VLOG(1) << "Failed to install ignore rule for the path /proc, "
+              << "the audit log stream may be more noisy"
+              << ", error: " << audit_errno_to_name(rc);
     }
   }
 
+  audit_rule_data* rule = audit_rule_create_data();
+
+  // Attempt to add each one of the rules we collected
+  for (int syscall_number : monitored_syscall_list_) {
+    audit_rule_syscall_data(rule, syscall_number);
+    if (FLAGS_audit_debug) {
+      VLOG(1) << "Audit rule queued for syscall " << syscall_number;
+    }
+  }
+
+  // clang-format off
+  int rule_add_error = audit_add_rule_data(audit_netlink_handle_, rule,
+    // We want to be notified when we exit from the syscall
+    AUDIT_FILTER_EXIT,
+
+    // Always audit this syscall event
+    AUDIT_ALWAYS
+  );
+  // clang-format on
+
+  if (rule_add_error >= 0) {
+    if (FLAGS_audit_debug) {
+      VLOG(1) << "Audit rule installed for all queued syscalls";
+    }
+  }
+
+  if (FLAGS_audit_force_unconfigure) {
+    installed_rule_list_.push_back(
+        std::make_tuple(rule, AUDIT_FILTER_EXIT, AUDIT_ALWAYS));
+  }
+
   return true;
-}
+} // namespace osquery
 
 bool AuditdNetlinkReader::clearAuditConfiguration() noexcept {
   int seq = audit_request_rules_list_data(audit_netlink_handle_);
@@ -591,8 +643,13 @@ void AuditdNetlinkReader::restoreAuditServiceConfiguration() noexcept {
   VLOG(1) << "Uninstalling the audit rules we have installed";
 
   for (auto& rule : installed_rule_list_) {
-    audit_delete_rule_data(
-        audit_netlink_handle_, &rule, AUDIT_FILTER_EXIT, AUDIT_ALWAYS);
+    int rc = audit_delete_rule_data(audit_netlink_handle_,
+                                    std::get<0>(rule),
+                                    std::get<1>(rule),
+                                    std::get<2>(rule));
+    if (rc < 0) {
+      VLOG(1) << "Uninstall rule error code " << audit_errno_to_name(rc);
+    }
   }
 
   installed_rule_list_.clear();

@@ -121,7 +121,7 @@ class AuditdNetlinkReader final : public InternalRunnable {
   std::vector<audit_reply> read_buffer_;
 
   /// The set of rules we applied (and that we'll uninstall when exiting)
-  std::vector<audit_rule_data> installed_rule_list_;
+  std::vector<std::tuple<audit_rule_data*, int, int>> installed_rule_list_;
 
   /// The syscalls we are listening for
   std::set<int> monitored_syscall_list_;
